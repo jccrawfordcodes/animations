@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Solar System Flyby</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;width:100%;overflow:hidden;background:#000;}
+  canvas{display:block;width:100vw;height:100vh;background:#000;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+let W=720,H=720,F=1;
+function resize(){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  W=Math.max(1,cv.clientWidth||window.innerWidth);
+  H=Math.max(1,cv.clientHeight||window.innerHeight);
+  cv.width=Math.round(W*dpr);
+  cv.height=Math.round(H*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  /* fit the 50-degree cone to the short side so framing survives any aspect ratio */
+  F=(Math.min(W,H)/2)/Math.tan(25*Math.PI/180);
+}
+resize();
+window.addEventListener('resize',resize);
+const TAU=Math.PI*2;
+const SPY=40;          // seconds per simulated year
+
+/* ---------- deterministic rng ---------- */
+let _s=987654321;
+function rnd(){_s=(_s*1664525+1013904223)>>>0;return _s/4294967296;}
+function rr(a,b){return a+(b-a)*rnd();}
+
+/* ---------- vector helpers ---------- */
+function sub(a,b){return [a[0]-b[0],a[1]-b[1],a[2]-b[2]];}
+function add(a,b){return [a[0]+b[0],a[1]+b[1],a[2]+b[2]];}
+function mul(a,s){return [a[0]*s,a[1]*s,a[2]*s];}
+function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+function cross(a,b){return [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];}
+function len(a){return Math.sqrt(dot(a,a));}
+function norm(a){const l=len(a)||1;return [a[0]/l,a[1]/l,a[2]/l];}
+
+/* ---------- color helpers ---------- */
+function hx(c){return [parseInt(c.substr(1,2),16),parseInt(c.substr(3,2),16),parseInt(c.substr(5,2),16)];}
+function rgb(a){return 'rgb('+(a[0]|0)+','+(a[1]|0)+','+(a[2]|0)+')';}
+function mix(c1,c2,t){return [c1[0]+(c2[0]-c1[0])*t,c1[1]+(c2[1]-c1[1])*t,c1[2]+(c2[2]-c1[2])*t];}
+function sampleStops(stops,p){
+  p=Math.max(0,Math.min(1,p));
+  for(let i=0;i<stops.length-1;i++){
+    if(p>=stops[i].p&&p<=stops[i+1].p){
+      const t=(p-stops[i].p)/((stops[i+1].p-stops[i].p)||1);
+      return mix(stops[i].rgb,stops[i+1].rgb,t);
+    }
+  }
+  return stops[stops.length-1].rgb;
+}
+function S(arr){return arr.map(o=>({p:o.p,rgb:hx(o.c)}));}
+
+/* ================= BODIES ================= */
+/* a = AU, T = orbital period (yr), r = drawn radius (AU, exaggerated) */
+const B={
+  sun    :{r:0.140,type:'sun'},
+  mercury:{a:0.387,T:0.241,inc:0.12,r:0.0120,rot:9 ,tilt:0.02,type:'rock'},
+  venus  :{a:0.723,T:0.615,inc:0.06,r:0.0205,rot:26,tilt:0.05,type:'venus'},
+  earth  :{a:1.000,T:1.000,inc:0.00,r:0.0215,rot:11,tilt:0.41,type:'earth'},
+  mars   :{a:1.524,T:1.881,inc:0.03,r:0.0150,rot:11,tilt:0.44,type:'mars'},
+  ceres  :{a:2.770,T:4.600,inc:0.18,r:0.0075,rot:7 ,tilt:0.07,type:'ceres',lumpy:0.055},
+  jupiter:{a:5.203,T:11.86,inc:0.02,r:0.0760,rot:14,tilt:0.05,type:'jupiter'},
+  saturn :{a:9.537,T:29.45,inc:0.04,r:0.0640,rot:15,tilt:0.47,type:'saturn'},
+  uranus :{a:19.19,T:84.00,inc:0.01,r:0.0420,rot:18,tilt:1.71,type:'uranus'},
+  neptune:{a:30.07,T:164.8,inc:0.03,r:0.0405,rot:16,tilt:0.49,type:'neptune'},
+  pluto  :{a:39.48,T:248.0,inc:0.30,r:0.0085,rot:20,tilt:0.42,type:'pluto'},
+  /* moons (orbits & periods exaggerated so they read on screen) */
+  luna    :{parent:'earth'  ,a:0.085,T:0.180,inc:0.09,r:0.0058,rot:30,tilt:0.0,type:'luna'},
+  io      :{parent:'jupiter',a:0.145,T:0.150,inc:0.02,r:0.0110,rot:30,tilt:0.0,type:'io'},
+  europa  :{parent:'jupiter',a:0.210,T:0.240,inc:0.02,r:0.0098,rot:30,tilt:0.0,type:'europa'},
+  ganymede:{parent:'jupiter',a:0.290,T:0.400,inc:0.02,r:0.0150,rot:30,tilt:0.0,type:'ganymede'},
+  callisto:{parent:'jupiter',a:0.400,T:0.620,inc:0.03,r:0.0140,rot:30,tilt:0.0,type:'callisto'},
+  titan   :{parent:'saturn' ,a:0.340,T:0.550,inc:0.05,r:0.0145,rot:30,tilt:0.0,type:'titan'},
+  triton  :{parent:'neptune',a:0.260,T:-0.420,inc:0.30,r:0.0095,rot:26,tilt:0.0,type:'triton'}
+};
+
+function bodyPos(name,t){
+  const b=B[name];
+  if(name==='sun')return [0,0,0];
+  const th=b.phase+TAU*(t/SPY)/b.T;
+  const x=b.a*Math.cos(th), z=b.a*Math.sin(th), y=b.a*Math.sin(b.inc||0)*Math.sin(th);
+  if(b.parent){const p=bodyPos(b.parent,t);return [p[0]+x,p[1]+y,p[2]+z];}
+  return [x,y,z];
+}
+/* flight offsets are measured in world axes: +X is "outward along the approach",
+   +Z is the lateral offset. Every target is parked near the +X line. */
+function frameOf(){return {u:[1,0,0],p:[0,0,1]};}
+
+/* ---- itinerary: pre / close / post waypoints so each world is on screen a while ---- */
+const EV=[
+  {b:'pluto'   ,dp:-0.050,dy:0.016,k:0.20,dw:2.4,cr:4.0},
+  {b:'triton'  ,dp:-0.030,dy:0.012,k:0.30,dw:1.9,cr:2.0,chain:1,dc:0.075},
+  {b:'neptune' ,dp:-0.190,dy:0.050,k:0.60,dw:2.4,cr:3.5,nopre:1},
+  {b:'uranus'  ,dp:-0.200,dy:0.050,k:0.60,dw:2.4,cr:4.0},
+  {b:'titan'   ,dp:-0.035,dy:0.014,k:0.32,dw:2.0,cr:2.2,chain:1,dc:0.100},
+  {b:'saturn'  ,dp:-0.220,dy:0.070,k:1.20,dw:2.6,cr:4.5,nopre:1},
+  {b:'callisto',dp:-0.035,dy:0.013,k:0.30,dw:1.8,cr:1.6,chain:1,dc:0.090},
+  {b:'europa'  ,dp:-0.030,dy:0.011,k:0.24,dw:1.8,cr:1.6,chain:1,nopre:1,dc:0.070},
+  {b:'jupiter' ,dp:-0.240,dy:0.070,k:1.30,dw:2.6,cr:4.5,nopre:1},
+  {b:'ceres'   ,dp:-0.045,dy:0.012,k:0.18,dw:2.4,cr:2.5},
+  {b:'mars'    ,dp:-0.095,dy:0.025,k:0.30,dw:2.4,cr:2.5},
+  {b:'luna'    ,dp:-0.022,dy:0.008,k:0.24,dw:1.8,cr:1.6,chain:1,dc:0.050},
+  {b:'earth'   ,dp:-0.055,dy:0.016,k:0.42,dw:2.2,cr:2.2,nopre:1},
+  {b:'venus'   ,dp:-0.105,dy:0.030,k:0.30,dw:2.4,cr:2.2},
+  {b:'mercury' ,dp:-0.055,dy:0.016,k:0.25,dw:2.2,cr:1.0,chain:1}
+];
+function wp(t,b,du,dp,dy,lb,e){
+  return {t:t,b:b,du:du,dp:dp,dy:dy,lb:lb||b,e:(e===undefined?1:e)};
+}
+const PATH=[], CLOSE={};
+PATH.push(wp(0,'pluto',80,40,9.0,'sun',0.35));
+PATH.push(wp(4,'pluto',18, 9,2.2,'sun',0.40));
+let tc=7;
+for(const ev of EV){
+  const lk=ev.lk||ev.b;
+  if(!ev.nopre){ PATH.push(wp(tc,ev.b,ev.k,ev.dp,ev.dy,lk)); tc+=ev.dw; }
+  PATH.push(wp(tc,ev.b,ev.dc||0,ev.dp,ev.dy,lk)); CLOSE[ev.b]=tc; tc+=ev.dw;
+  if(!ev.chain){ PATH.push(wp(tc,ev.b,-ev.k,ev.dp,ev.dy,lk)); }
+  tc+=ev.cr;
+}
+/* slingshot arc around the Sun, then out of the system */
+const SUNARC=[[0.30,-0.18,0.040,0.60,2.2],[0.10,-0.30,0.045,0.35,2.0],[-0.12,-0.31,0.045,0.30,2.0],
+  [-0.30,-0.22,0.040,0.35,2.0],[-0.45,-0.06,0.040,0.45,2.0],[-1.1,0.35,0.080,0.40,2.4],
+  [-4,2,0.30,0.35,3.2],[-18,9,1.0,0.35,4.5],[-60,32,3.2,0.35,6.5],[-140,75,7.0,0.35,6.0]];
+for(const a of SUNARC){ tc+=a[4]; PATH.push(wp(tc,'sun',a[0],a[1],a[2],'sun',a[3])); }
+const LOOP=tc;
+
+/* choose orbital phases so every world sits on the flight path when we get there */
+const ANG={pluto:0.12,neptune:-0.08,uranus:0.10,saturn:-0.06,jupiter:0.08,ceres:-0.05,
+           mars:0.10,earth:-0.07,venus:0.09,mercury:-0.10};
+for(const k in ANG){ B[k].phase = ANG[k] - TAU*(CLOSE[k]/SPY)/B[k].T; }
+function angAt(name,t){const b=B[name];return b.phase+TAU*(t/SPY)/b.T;}
+const MOONSET=[['triton',0.22],['titan',0.20],['callisto',0.30],['ganymede',-0.75],['europa',0.12],['io',-1.15],['luna',0.28]];
+for(const m of MOONSET){
+  const b=B[m[0]], tcl=(CLOSE[m[0]]!==undefined?CLOSE[m[0]]:CLOSE[b.parent]);
+  b.phase=(angAt(b.parent,tcl)+m[1]) - TAU*(tcl/SPY)/b.T;
+}
+/* turn signature features toward the camera at closest approach */
+['jupiter','neptune','pluto','ceres'].forEach(n=>{B[n].face=-TAU*(CLOSE[n]/B[n].rot);});
+
+function wpPos(w,t){
+  const f=frameOf(), c=bodyPos(w.b,t);
+  return [c[0]+f.u[0]*w.du+f.p[0]*w.dp, c[1]+w.dy, c[2]+f.u[2]*w.du+f.p[2]*w.dp];
+}
+function smooth(x){return x*x*(3-2*x);}
+function lerpP(a,b,s){return [a[0]+(b[0]-a[0])*s,a[1]+(b[1]-a[1])*s,a[2]+(b[2]-a[2])*s];}
+/* centripetal Catmull-Rom: behaves with wildly uneven waypoint spacing */
+function crc(p0,p1,p2,p3,u){
+  const k=(a,b)=>Math.max(1e-4,Math.pow(len(sub(b,a)),0.5));
+  const t0=0,t1=t0+k(p0,p1),t2=t1+k(p1,p2),t3=t2+k(p2,p3);
+  const t=t1+(t2-t1)*u;
+  const A1=lerpP(p0,p1,(t-t0)/(t1-t0));
+  const A2=lerpP(p1,p2,(t-t1)/(t2-t1));
+  const A3=lerpP(p2,p3,(t-t2)/(t3-t2));
+  const B1=lerpP(A1,A2,(t-t0)/(t2-t0));
+  const B2=lerpP(A2,A3,(t-t1)/(t3-t1));
+  return lerpP(B1,B2,(t-t1)/(t2-t1));
+}
+/* keep neighbour points local: waypoint spacing varies by 3 orders of magnitude */
+function clampN(pn,pa,pb){
+  const L=len(sub(pb,pa))*1.5+1e-9, d=sub(pn,pa), l=len(d)||1e-9;
+  return l>L?add(pa,mul(d,L/l)):pn;
+}
+function camAt(t){
+  let i=0;
+  while(i<PATH.length-2 && t>=PATH[i+1].t) i++;
+  const w1=PATH[i], w2=PATH[i+1];
+  const p1=wpPos(w1,t), p2=wpPos(w2,t);
+  let p0=(i>0)?wpPos(PATH[i-1],t):lerpP(p2,p1,2);
+  let p3=(i+2<PATH.length)?wpPos(PATH[i+2],t):lerpP(p1,p2,2);
+  p0=clampN(p0,p1,p2); p3=clampN(p3,p2,p1);
+  let u=(t-w1.t)/(w2.t-w1.t); u=Math.max(0,Math.min(1,u));
+  const e=w1.e, ue=(1-e)*u+e*smooth(u);
+  let eye=crc(p0,p1,p2,p3,ue);
+  /* soft collision guard so the camera never dives through a world */
+  for(const n in B){
+    const bp=bodyPos(n,t), d=sub(eye,bp), l=len(d)||1e-9;
+    const m=(n==='sun'?2.25:2.0)*B[n].r;
+    if(l<m*2.2){
+      const nl=Math.pow(Math.pow(l,4)+Math.pow(m,4),0.25);
+      eye=add(bp,mul(d,nl/l));
+    }
+  }
+  const l1=bodyPos(w1.lb,t), l2=bodyPos(w2.lb,t), us=smooth(u);
+  const look=lerpP(l1,l2,us);
+  const f=norm(sub(look,eye));
+  let up=[0,1,0];
+  const r=norm(cross(f,up));
+  up=cross(r,f);
+  const sw=Math.max(0,Math.min(1,(us-0.35)/0.30));
+  const tgt=(w1.lb===w2.lb)?[{n:w1.lb,a:1}]:[{n:w1.lb,a:1-sw},{n:w2.lb,a:sw}];
+  return {eye:eye,f:f,r:r,u:up,tgt:tgt};
+}
+
+/* ================= PROJECTION ================= */
+let CAM=null;
+function project(p){
+  const d=sub(p,CAM.eye);
+  const z=dot(d,CAM.f);
+  if(z<=0.0008) return null;
+  const s=F/z;
+  return {x:W/2+dot(d,CAM.r)*s, y:H/2-dot(d,CAM.u)*s, z:z, s:s};
+}
+
+/* ================= STARS & SMALL BODIES ================= */
+const STARS=[];
+for(let i=0;i<900;i++){
+  const th=rnd()*TAU, ph=Math.acos(2*rnd()-1), R=4000;
+  STARS.push({p:[R*Math.sin(ph)*Math.cos(th),R*Math.cos(ph),R*Math.sin(ph)*Math.sin(th)],
+              m:rr(0.25,1), c:rnd()<0.12?'#ffd9b0':(rnd()<0.14?'#bcd4ff':'#ffffff')});
+}
+const ROCKS=[];
+function makeRock(a,spread,angCenter,angSpread,rmin,rmax,yf,kind){
+  const ang=angCenter+(rnd()*2-1)*angSpread;
+  ROCKS.push({a:a+(rnd()*2-1)*spread, ph:ang, T:Math.pow(a,1.5), tref:(kind?0:CLOSE.ceres),
+              y:(rnd()*2-1)*yf, r:rr(rmin,rmax), sh:rr(0.6,1.4), g:rr(0.45,1), kind:kind});
+}
+for(let i=0;i<900;i++) makeRock(2.75,0.65,rnd()*TAU,Math.PI,0.0004,0.0018,0.09,0);
+for(let i=0;i<330;i++) makeRock(2.78,0.22,ANG.ceres,0.055,0.0007,0.0024,0.034,0); // dense swarm on the flight path
+for(let i=0;i<420;i++) makeRock(65,40,rnd()*TAU,Math.PI,0.004,0.016,9.0,1);   // scattered Kuiper / inner Oort
+for(let i=0;i<520;i++) makeRock(70,28,ANG.pluto,0.030,0.006,0.030,1.6,1);    // icy bodies strung along the way in
+ROCKS.forEach(o=>{o.ph-=TAU*0; o.ph0=o.ph;});
+function rockPos(o,t){
+  const th=o.ph0+TAU*((t-o.tref)/SPY)/(o.T*(o.kind?4:1));
+  return [o.a*Math.cos(th), o.y, o.a*Math.sin(th)];
+}
+
+/* ================= TEXTURES ================= */
+function noiseArr(n,seed){const old=_s;_s=seed;const a=[];for(let i=0;i<n;i++)a.push(rnd());_s=old;return a;}
+function spotArr(n,seed,latf){const old=_s;_s=seed;const a=[];
+  for(let i=0;i<n;i++)a.push({lon:rnd()*TAU,lat:(rnd()*2-1)*(latf||1.3),r:rr(0.06,0.3),k:rnd()});
+  _s=old;return a;}
+
+const JUP=S([{p:0,c:'#c9a377'},{p:.14,c:'#e6d6bd'},{p:.26,c:'#b4784c'},{p:.36,c:'#e8dcc6'},{p:.44,c:'#c07a4e'},
+             {p:.52,c:'#efe3cc'},{p:.60,c:'#a96a42'},{p:.70,c:'#dcc7a6'},{p:.80,c:'#b98a5e'},{p:.90,c:'#e2d3b8'},{p:1,c:'#b98f68'}]);
+const SAT=S([{p:0,c:'#c2a678'},{p:.2,c:'#e5d6b0'},{p:.35,c:'#d4bd8e'},{p:.5,c:'#f0e4c6'},{p:.65,c:'#d8c093'},{p:.82,c:'#e8dab5'},{p:1,c:'#bfa476'}]);
+const URA=S([{p:0,c:'#a9dbe0'},{p:.35,c:'#bfeaec'},{p:.5,c:'#c9f0f0'},{p:.7,c:'#a9dde3'},{p:1,c:'#8fc9d4'}]);
+const NEP=S([{p:0,c:'#2a52a8'},{p:.3,c:'#3f74cc'},{p:.5,c:'#5b90de'},{p:.7,c:'#3466bd'},{p:1,c:'#26489a'}]);
+const VEN=S([{p:0,c:'#c9a45c'},{p:.3,c:'#eed9a4'},{p:.5,c:'#f6ead0'},{p:.7,c:'#e3cb94'},{p:1,c:'#c79f58'}]);
+const TIT=S([{p:0,c:'#a1651f'},{p:.35,c:'#d79a3c'},{p:.6,c:'#e8b862'},{p:1,c:'#9c5f1d'}]);
+
+const NZ={jupiter:noiseArr(72,11),saturn:noiseArr(72,22),uranus:noiseArr(72,33),neptune:noiseArr(72,44),venus:noiseArr(72,55),titan:noiseArr(72,66)};
+const SP={
+  jupiter:spotArr(16,101,1.0), saturn:spotArr(8,102,1.0), neptune:spotArr(5,103,0.9),
+  mercury:spotArr(26,104,1.4), luna:spotArr(20,105,1.4), mars:spotArr(16,106,1.1),
+  ceres:spotArr(14,107,1.4), io:spotArr(20,108,1.3), europa:spotArr(16,109,1.3),
+  ganymede:spotArr(18,110,1.3), callisto:spotArr(26,111,1.4), pluto:spotArr(12,112,1.2),
+  triton:spotArr(14,114,1.2),
+  clouds:spotArr(26,113,1.15)
+};
+SP.clouds.forEach(o=>{o.r*=0.52;});
+SP.jupiter.forEach(o=>{o.r*=0.62;});
+SP.saturn.forEach(o=>{o.r*=0.7;});
+/* sunspots, rejection-sampled so they never overlap; about 5-6 face us at a time */
+const SUNROT=70;
+const SUNSPOTS=(function(){
+  const old=_s;_s=31337;const out=[];let tries=0;
+  while(out.length<12&&tries++<900){
+    const lon=rnd()*TAU, lat=(rnd()*2-1)*0.55, r=0.030+rnd()*0.028;
+    let ok=true;
+    for(const o of out){
+      const dl=Math.abs(((lon-o.lon+Math.PI*3)%TAU)-Math.PI);
+      const d=Math.acos(Math.max(-1,Math.min(1,Math.sin(lat)*Math.sin(o.lat)+Math.cos(lat)*Math.cos(o.lat)*Math.cos(dl))));
+      if(d<(r+o.r)*2.6+0.34){ok=false;break;}
+    }
+    if(ok)out.push({lon:lon,lat:lat,r:r});
+  }
+  _s=old;return out;})();
+const CONTS=[
+  {lon:0.15,lat:0.62,w:0.95,h:0.42},{lon:0.55,lat:0.10,w:0.52,h:0.72},
+  {lon:1.55,lat:0.55,w:0.80,h:0.40},{lon:2.05,lat:0.18,w:0.52,h:0.46},
+  {lon:2.70,lat:-0.42,w:0.70,h:0.62},{lon:3.45,lat:0.45,w:1.05,h:0.50},
+  {lon:4.15,lat:-0.05,w:0.62,h:0.50},{lon:4.85,lat:-0.62,w:0.66,h:0.34},
+  {lon:5.45,lat:0.30,w:0.58,h:0.46},{lon:5.95,lat:-0.28,w:0.46,h:0.40}
+];
+(function(){const old=_s;_s=777;
+  for(const c of CONTS){
+    const n=3+((rnd()*3)|0), lb=[];
+    for(let i=0;i<n;i++) lb.push([(rnd()-0.5)*c.w*0.5,(rnd()-0.5)*c.h*0.5,0.22+rnd()*0.26,rnd()*3]);
+    c.lobes=lb;
+  }
+  _s=old;})();
+
+function drawBands(g,R,stops,nz,contrast){
+  const n=64;
+  for(let i=0;i<n;i++){
+    const v0=-1+2*i/n, y0=-R*v0, y1=-R*(-1+2*(i+1)/n);
+    let c=sampleStops(stops,(v0+1)/2);
+    const k=(nz[i%nz.length]-0.5)*contrast;
+    c=[c[0]*(1+k),c[1]*(1+k),c[2]*(1+k)];
+    g.fillStyle=rgb(c);
+    g.fillRect(-R-1,Math.min(y0,y1)-0.6,2*R+2,Math.abs(y1-y0)+1.2);
+  }
+}
+function drawSpots(g,R,rot,spots,colFn,sq){
+  for(let i=0;i<spots.length;i++){
+    const s=spots[i], a=s.lon+rot, d=Math.cos(a);
+    if(d<=0.08) continue;
+    const cl=Math.cos(s.lat*0.9);
+    const x=R*Math.sin(a)*cl, y=-R*Math.sin(s.lat*0.9);
+    g.globalAlpha=Math.min(1,d*1.3)*(sq||1);
+    g.fillStyle=colFn(s,i);
+    g.beginPath();
+    g.ellipse(x,y,s.r*R*d,s.r*R*(0.75+0.3*s.k),0,0,TAU);
+    g.fill();
+  }
+  g.globalAlpha=1;
+}
+
+function paintSurface(g,name,R,t){
+  const b=B[name], rot=TAU*(t/(b.rot||12));
+  g.save();
+  g.rotate(b.tilt||0);
+  switch(b.type){
+    case 'jupiter':
+      drawBands(g,R,JUP,NZ.jupiter,0.10);
+      // Great Red Spot
+      {const a=(b.face||0)+rot, d=Math.cos(a);
+       if(d>0.05){
+         const x=R*Math.sin(a)*Math.cos(0.32), y=R*0.31;
+         g.globalAlpha=Math.min(1,d*1.4);
+         const gr=g.createRadialGradient(x,y,0,x,y,R*0.20);
+         gr.addColorStop(0,'#c4482c');gr.addColorStop(0.6,'#b8583a');gr.addColorStop(1,'rgba(160,90,60,0)');
+         g.fillStyle=gr;g.beginPath();g.ellipse(x,y,R*0.21*d,R*0.105,0,0,TAU);g.fill();
+         g.globalAlpha=1;
+       }}
+      break;
+    case 'saturn':
+      drawBands(g,R,SAT,NZ.saturn,0.055);
+      drawSpots(g,R,rot,SP.saturn,()=> 'rgba(255,248,225,0.22)');
+      break;
+    case 'uranus':
+      drawBands(g,R,URA,NZ.uranus,0.03);
+      break;
+    case 'neptune':
+      drawBands(g,R,NEP,NZ.neptune,0.055);
+      {const a=(b.face||0)+rot, d=Math.cos(a);
+       if(d>0.05){
+         const x=R*Math.sin(a)*Math.cos(0.26), y=-R*0.26;
+         g.globalAlpha=Math.min(1,d*1.4);
+         const gd=g.createRadialGradient(x,y,0,x,y,R*0.20);
+         gd.addColorStop(0,'#12244f');gd.addColorStop(0.6,'rgba(24,44,96,0.8)');gd.addColorStop(1,'rgba(30,58,120,0)');
+         g.fillStyle=gd;g.beginPath();g.ellipse(x,y,R*0.22*d,R*0.11,0,0,TAU);g.fill();
+         g.globalAlpha=1;
+       }}
+      break;
+    case 'venus':
+      drawBands(g,R,VEN,NZ.venus,0.05);
+      drawSpots(g,R,rot*0.6,SP.clouds,()=> 'rgba(255,246,220,0.30)');
+      break;
+    case 'titan':
+      drawBands(g,R,TIT,NZ.titan,0.05);
+      break;
+    case 'earth': {
+      const og=g.createLinearGradient(0,-R,0,R);
+      og.addColorStop(0,'#14335e');og.addColorStop(0.5,'#1b58a6');og.addColorStop(1,'#123159');
+      g.fillStyle=og;g.fillRect(-R,-R,2*R,2*R);
+      for(const c of CONTS){
+        const a=c.lon+rot, d=Math.cos(a);
+        if(d<=0.05) continue;
+        const x=R*Math.sin(a)*Math.cos(c.lat*0.8), y=-R*Math.sin(c.lat*0.9);
+        g.globalAlpha=Math.min(1,d*1.6);
+        g.fillStyle=(c.lat>0.5||c.lat<-0.5)?'#787f52':'#3d6b35';
+        for(const lb of c.lobes){
+          g.beginPath();
+          g.ellipse(x+lb[0]*R*d,y+lb[1]*R,c.w*R*lb[2]*d,c.h*R*lb[2],lb[3],0,TAU);
+          g.fill();
+        }
+        g.fillStyle='rgba(140,122,74,0.75)';
+        g.beginPath();g.ellipse(x+R*0.03*d,y+R*0.03,c.w*R*0.34*d,c.h*R*0.30,0.3,0,TAU);g.fill();
+      }
+      g.globalAlpha=1;
+      g.fillStyle='rgba(245,250,255,0.92)';
+      g.beginPath();g.ellipse(0,-R*0.94,R*0.55,R*0.14,0,0,TAU);g.fill();
+      g.beginPath();g.ellipse(0, R*0.94,R*0.62,R*0.16,0,0,TAU);g.fill();
+      drawSpots(g,R,rot*1.12,SP.clouds,()=> 'rgba(255,255,255,0.42)',0.85);
+      break;
+    }
+    case 'mars': {
+      const og=g.createLinearGradient(0,-R,0,R);
+      og.addColorStop(0,'#b4602f');og.addColorStop(0.5,'#c96f3a');og.addColorStop(1,'#a85428');
+      g.fillStyle=og;g.fillRect(-R,-R,2*R,2*R);
+      drawSpots(g,R,rot,SP.mars,(s)=>s.k<0.55?'rgba(120,58,32,0.55)':'rgba(214,150,105,0.4)');
+      g.fillStyle='rgba(250,250,255,0.9)';
+      g.beginPath();g.ellipse(0,-R*0.95,R*0.42,R*0.12,0,0,TAU);g.fill();
+      g.beginPath();g.ellipse(0, R*0.96,R*0.30,R*0.09,0,0,TAU);g.fill();
+      break;
+    }
+    case 'pluto': {
+      g.fillStyle='#9a8570';g.fillRect(-R,-R,2*R,2*R);
+      drawSpots(g,R,rot,SP.pluto,(s)=>s.k<0.5?'rgba(90,66,52,0.6)':'rgba(214,196,172,0.5)');
+      {const a=(b.face||0)+rot,d=Math.cos(a);
+       if(d>0.05){const x=R*Math.sin(a)*0.9;
+        g.globalAlpha=Math.min(1,d*1.4);g.fillStyle='#e8dfcd';
+        g.beginPath();g.ellipse(x,R*0.15,R*0.42*d,R*0.36,0,0,TAU);g.fill();g.globalAlpha=1;}}
+      break;
+    }
+    case 'ceres': {
+      g.fillStyle='#7d7873';g.fillRect(-R*1.3,-R*1.3,2.6*R,2.6*R);
+      drawSpots(g,R,rot,SP.ceres,(s)=>s.k<0.6?'rgba(72,68,64,0.7)':'rgba(150,146,140,0.6)');
+      {const a=(b.face||0)+rot,d=Math.cos(a);
+       if(d>0.1){g.globalAlpha=Math.min(1,d);g.fillStyle='#f2f4f6';
+        g.beginPath();g.ellipse(R*Math.sin(a)*0.8,-R*0.1,R*0.11*d,R*0.1,0,0,TAU);g.fill();g.globalAlpha=1;}}
+      break;
+    }
+    case 'triton': {
+      const tg=g.createLinearGradient(0,-R,0,R);
+      tg.addColorStop(0,'#dfe0dd');tg.addColorStop(0.55,'#e6ddd4');tg.addColorStop(1,'#e8c9b6');
+      g.fillStyle=tg;g.fillRect(-R,-R,2*R,2*R);
+      {const cg=g.createRadialGradient(0,R*0.85,R*0.1,0,R*0.85,R*1.05);
+       cg.addColorStop(0,'rgba(248,224,208,0.95)');cg.addColorStop(0.65,'rgba(245,216,198,0.75)');
+       cg.addColorStop(1,'rgba(240,210,192,0)');
+       g.fillStyle=cg;g.fillRect(-R,-R,2*R,2*R);}
+      drawSpots(g,R,rot,SP.triton,(s)=>s.k<0.55?'rgba(150,132,122,0.42)':'rgba(252,248,244,0.5)',0.9);
+      g.strokeStyle='rgba(120,104,96,0.35)';g.lineWidth=Math.max(0.5,R*0.015);
+      for(let i=0;i<4;i++){const o=(i*0.5-0.75)*R;
+        g.beginPath();g.moveTo(-R,o);g.bezierCurveTo(-R*0.35,o+R*0.12,R*0.35,o-R*0.10,R,o+R*0.14);g.stroke();}
+      break;
+    }
+    case 'luna':
+      g.fillStyle='#a6a29c';g.fillRect(-R,-R,2*R,2*R);
+      drawSpots(g,R,rot,SP.luna,(s)=>s.k<0.45?'rgba(88,88,92,0.75)':'rgba(206,203,197,0.55)');
+      break;
+    case 'rock': // Mercury
+      g.fillStyle='#8d867e';g.fillRect(-R,-R,2*R,2*R);
+      drawSpots(g,R,rot,SP.mercury,(s)=>s.k<0.5?'rgba(100,94,88,0.7)':'rgba(176,170,162,0.6)');
+      break;
+    case 'io':
+      g.fillStyle='#e0d05c';g.fillRect(-R,-R,2*R,2*R);
+      drawSpots(g,R,rot,SP.io,(s)=>s.k<0.4?'rgba(180,80,40,0.55)':(s.k<0.7?'rgba(250,240,190,0.6)':'rgba(120,70,30,0.5)'));
+      break;
+    case 'europa':
+      g.fillStyle='#e9e6de';g.fillRect(-R,-R,2*R,2*R);
+      drawSpots(g,R,rot,SP.europa,()=> 'rgba(206,196,182,0.5)',0.7);
+      g.strokeStyle='rgba(176,146,124,0.38)';g.lineWidth=Math.max(0.5,R*0.012);
+      for(let i=0;i<7;i++){const o=(i*0.29-1)*R;g.beginPath();
+        g.moveTo(-R,o);g.bezierCurveTo(-R*0.3,o+R*0.16,R*0.3,o-R*0.10,R,o+R*0.20);g.stroke();}
+      break;
+    case 'ganymede':
+      g.fillStyle='#96897c';g.fillRect(-R,-R,2*R,2*R);
+      drawSpots(g,R,rot,SP.ganymede,(s)=>s.k<0.5?'rgba(70,64,58,0.55)':'rgba(190,182,172,0.5)');
+      break;
+    case 'callisto':
+      g.fillStyle='#6b5f56';g.fillRect(-R,-R,2*R,2*R);
+      drawSpots(g,R,rot,SP.callisto,(s)=>s.k<0.55?'rgba(44,38,34,0.65)':'rgba(176,168,158,0.55)');
+      break;
+    default:
+      g.fillStyle='#888';g.fillRect(-R,-R,2*R,2*R);
+  }
+  g.restore();
+}
+
+/* ---- draw a lit sphere ---- */
+function drawSphere(name,pw,sc,t){
+  const b=B[name];
+  const R=b.r*sc.s;
+  if(R<0.45){ ctx.fillStyle='#cfd6e0';ctx.fillRect(sc.x,sc.y,1,1);return; }
+  // light direction (sun at origin) in view space
+  const L=norm(sub([0,0,0],pw));
+  const lx=dot(L,CAM.r), ly=dot(L,CAM.u), lz=dot(L,CAM.f);
+  ctx.save();
+  ctx.translate(sc.x,sc.y);
+  ctx.beginPath();
+  if(b.lumpy){
+    const sp=TAU*(t/(b.rot||12));
+    for(let i=0;i<=60;i++){
+      const a=i/60*TAU;
+      const rr=R*(1+b.lumpy*(0.62*Math.sin(3*a+sp)+0.40*Math.sin(5*a-1.3*sp)+0.24*Math.sin(7*a+2.1)));
+      const px=Math.cos(a)*rr, py=Math.sin(a)*rr;
+      if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);
+    }
+    ctx.closePath();
+  } else ctx.arc(0,0,R,0,TAU);
+  ctx.clip();
+  paintSurface(ctx,name,R,t);
+  // terminator shading
+  const off=0.95;
+  const gx=lx*R*off, gy=-ly*R*off;
+  const g2=ctx.createRadialGradient(gx,gy,R*0.05,gx,gy,R*(1.7-0.55*Math.max(0,-lz)));
+  g2.addColorStop(0,'rgba(255,255,255,1)');
+  g2.addColorStop(0.42,'rgba(228,228,232,1)');
+  g2.addColorStop(0.72,'rgba(96,96,104,1)');
+  g2.addColorStop(1,'rgba(6,7,12,1)');
+  ctx.globalCompositeOperation='multiply';
+  ctx.fillStyle=g2;ctx.fillRect(-R*1.3,-R*1.3,2.6*R,2.6*R);
+  ctx.globalCompositeOperation='source-over';
+  ctx.restore();
+  // atmosphere rim
+  const atm={earth:'rgba(120,180,255,',venus:'rgba(255,225,160,',jupiter:'rgba(240,210,170,',
+             saturn:'rgba(240,225,180,',uranus:'rgba(160,240,245,',neptune:'rgba(110,160,255,',
+             titan:'rgba(255,170,60,',mars:'rgba(230,150,110,'}[name];
+  if(atm&&R>3){
+    const back=Math.max(0,-lz);
+    const ga=ctx.createRadialGradient(sc.x,sc.y,R*0.93,sc.x,sc.y,R*1.14);
+    ga.addColorStop(0,atm+(0.32+0.5*back)+')');
+    ga.addColorStop(1,atm+'0)');
+    ctx.globalCompositeOperation='lighter';
+    ctx.fillStyle=ga;ctx.beginPath();ctx.arc(sc.x,sc.y,R*1.15,0,TAU);ctx.fill();
+    ctx.globalCompositeOperation='source-over';
+  }
+}
+
+/* ---- Saturn's rings, as depth-sorted 3D quads ---- */
+const RTILT=0.4665, RAZ=1.15;
+const RAXIS=norm([Math.sin(RTILT)*Math.cos(RAZ),Math.cos(RTILT),Math.sin(RTILT)*Math.sin(RAZ)]);
+const RE1=norm(cross(RAXIS,[0,0,1])), RE2=cross(RAXIS,RE1);
+const RBANDS=[
+  {a:1.22,b:1.50,c:'rgba(196,176,140,0.42)'},
+  {a:1.52,b:1.74,c:'rgba(226,210,176,0.72)'},
+  {a:1.75,b:1.94,c:'rgba(240,226,192,0.85)'},
+  {a:1.96,b:2.02,c:'rgba(150,136,112,0.25)'},
+  {a:2.03,b:2.28,c:'rgba(210,194,160,0.55)'}
+];
+function pushRings(list,center,t){
+  const R=B.saturn.r, N=72;
+  for(const bd of RBANDS){
+    for(let i=0;i<N;i++){
+      const a0=i/N*TAU, a1=(i+1)/N*TAU;
+      const q=[];
+      let zsum=0, ok=true;
+      const pts=[[bd.a,a0],[bd.b,a0],[bd.b,a1],[bd.a,a1]];
+      for(const pr of pts){
+        const rad=pr[0]*R, ang=pr[1];
+        const p=[center[0]+ (RE1[0]*Math.cos(ang)+RE2[0]*Math.sin(ang))*rad,
+                 center[1]+ (RE1[1]*Math.cos(ang)+RE2[1]*Math.sin(ang))*rad,
+                 center[2]+ (RE1[2]*Math.cos(ang)+RE2[2]*Math.sin(ang))*rad];
+        const s=project(p);
+        if(!s){ok=false;break;}
+        q.push(s); zsum+=s.z;
+      }
+      if(!ok) continue;
+      const z=zsum/4;
+      list.push({z:z,draw:function(){
+        ctx.fillStyle=bd.c;
+        ctx.beginPath();ctx.moveTo(q[0].x,q[0].y);
+        for(let k=1;k<4;k++)ctx.lineTo(q[k].x,q[k].y);
+        ctx.closePath();ctx.fill();
+      }});
+    }
+  }
+}
+
+/* ---- the Sun ---- */
+function drawSun(sc,t){
+  const R=B.sun.r*sc.s;
+  /* very slow, shallow breathing of the corona; the disc itself stays put */
+  const fl=1+0.012*Math.sin(t*0.34)+0.007*Math.sin(t*0.53);
+  ctx.globalCompositeOperation='lighter';
+  const halo=ctx.createRadialGradient(sc.x,sc.y,R*0.8,sc.x,sc.y,R*7*fl);
+  halo.addColorStop(0,'rgba(255,220,150,0.55)');
+  halo.addColorStop(0.18,'rgba(255,170,80,0.22)');
+  halo.addColorStop(0.5,'rgba(255,130,50,0.07)');
+  halo.addColorStop(1,'rgba(255,120,40,0)');
+  ctx.fillStyle=halo;ctx.beginPath();ctx.arc(sc.x,sc.y,R*7*fl,0,TAU);ctx.fill();
+  ctx.globalCompositeOperation='source-over';
+  const g=ctx.createRadialGradient(sc.x-R*0.1,sc.y-R*0.1,R*0.1,sc.x,sc.y,R);
+  g.addColorStop(0,'#fffdf2');g.addColorStop(0.55,'#ffe9a8');
+  g.addColorStop(0.85,'#ffb43c');g.addColorStop(1,'#ff8418');
+  ctx.fillStyle=g;ctx.beginPath();ctx.arc(sc.x,sc.y,R,0,TAU);ctx.fill();
+  if(R>8){
+    /* photosphere mottling, kept faint so the spots read */
+    ctx.save();ctx.beginPath();ctx.arc(sc.x,sc.y,R,0,TAU);ctx.clip();
+    const old=_s;_s=4242;
+    for(let i=0;i<40;i++){
+      const a=rnd()*TAU,rd=Math.sqrt(rnd())*R;
+      ctx.fillStyle='rgba(255,170,60,'+(0.03+rnd()*0.05)+')';
+      ctx.beginPath();ctx.ellipse(sc.x+Math.cos(a)*rd,sc.y+Math.sin(a)*rd,R*0.12*rnd()+R*0.03,R*0.08*rnd()+R*0.02,0,0,TAU);ctx.fill();
+    }
+    _s=old;
+    /* sunspots: a spaced-out set carried around by the Sun's rotation */
+    const srot=TAU*(t/SUNROT);
+    for(const sp of SUNSPOTS){
+      const a=sp.lon+srot, d=Math.cos(a);
+      if(d<=0.12) continue;
+      const cl=Math.cos(sp.lat);
+      const x=sc.x+R*Math.sin(a)*cl, y=sc.y-R*Math.sin(sp.lat);
+      const rx=sp.r*R*d, ry=sp.r*R;
+      ctx.globalAlpha=Math.min(1,(d-0.12)*3);
+      ctx.fillStyle='rgba(180,96,26,0.55)';
+      ctx.beginPath();ctx.ellipse(x,y,rx*1.75,ry*1.75,0,0,TAU);ctx.fill();
+      ctx.fillStyle='rgba(120,54,12,0.85)';
+      ctx.beginPath();ctx.ellipse(x,y,rx,ry,0,0,TAU);ctx.fill();
+      ctx.globalAlpha=1;
+    }
+    ctx.restore();
+    /* prominences: at most two alive at once, each a real arcing loop */
+    ctx.globalCompositeOperation='lighter';
+    for(let k=0;k<3;k++){
+      const ph=t/13+k/3, cyc=Math.floor(ph), u=ph-cyc;
+      if(u>0.46) continue;
+      const env=Math.sin(Math.PI*u/0.46);
+      const hs=(n)=>{const v=Math.sin((cyc*3+k)*127.1+n*311.7)*43758.5453;return v-Math.floor(v);};
+      const a0=hs(1)*TAU;
+      const span=(0.20+hs(2)*0.20)*(hs(3)<0.5?1:-1);
+      const hgt=R*(0.22+hs(4)*0.26)*env;
+      const a1=a0-span/2, a2=a0+span/2;
+      const p1x=sc.x+Math.cos(a1)*R*0.985, p1y=sc.y+Math.sin(a1)*R*0.985;
+      const p2x=sc.x+Math.cos(a2)*R*0.985, p2y=sc.y+Math.sin(a2)*R*0.985;
+      const cOut=R+hgt*2.50, cIn=R+hgt*1.92;
+      const oX=sc.x+Math.cos(a0)*cOut, oY=sc.y+Math.sin(a0)*cOut;
+      const iX=sc.x+Math.cos(a0)*cIn,  iY=sc.y+Math.sin(a0)*cIn;
+      const gp=ctx.createRadialGradient(sc.x,sc.y,R*0.94,sc.x,sc.y,R+hgt*1.45);
+      gp.addColorStop(0,'rgba(255,206,130,'+(0.9*env)+')');
+      gp.addColorStop(0.55,'rgba(255,140,52,'+(0.6*env)+')');
+      gp.addColorStop(1,'rgba(255,80,20,0)');
+      ctx.fillStyle=gp;
+      ctx.beginPath();
+      ctx.moveTo(p1x,p1y);
+      ctx.quadraticCurveTo(oX,oY,p2x,p2y);
+      ctx.quadraticCurveTo(iX,iY,p1x,p1y);
+      ctx.fill();
+      /* footpoint glow */
+      for(const fp of [[p1x,p1y],[p2x,p2y]]){
+        const gf=ctx.createRadialGradient(fp[0],fp[1],0,fp[0],fp[1],R*0.07);
+        gf.addColorStop(0,'rgba(255,214,150,'+(0.4*env)+')');
+        gf.addColorStop(1,'rgba(255,120,40,0)');
+        ctx.fillStyle=gf;ctx.beginPath();ctx.arc(fp[0],fp[1],R*0.07,0,TAU);ctx.fill();
+      }
+    }
+    ctx.globalCompositeOperation='source-over';
+  }
+}
+
+/* ================= TARGET LABELS ================= */
+const NAMES={sun:'The Sun',luna:'Luna',ceres:'Ceres',io:'Io',europa:'Europa',
+  ganymede:'Ganymede',callisto:'Callisto',titan:'Titan',triton:'Triton'};
+function label(n){return NAMES[n]||(n.charAt(0).toUpperCase()+n.slice(1));}
+const SYSTEM={};
+for(const n in B){const root=B[n].parent||n;(SYSTEM[root]=SYSTEM[root]||[]).push(n);}
+function drawLabels(t){
+  const fs=Math.max(11,Math.round(Math.min(W,H)*0.023));
+  /* everything in the planetary system we're currently flying through */
+  const show={};
+  for(const g of CAM.tgt){
+    const root=B[g.n].parent||g.n;
+    for(const m of (SYSTEM[root]||[g.n])) show[m]=Math.max(show[m]||0,g.a);
+  }
+  ctx.save();
+  ctx.textAlign='center';
+  ctx.textBaseline='top';
+  ctx.font='600 '+fs+'px "Helvetica Neue",Helvetica,Arial,sans-serif';
+  if('letterSpacing' in ctx) ctx.letterSpacing=Math.round(fs*0.22)+'px';
+  for(const n in show){
+    const a=show[n];
+    if(a<=0.02) continue;
+    const p=bodyPos(n,t), sc=project(p);
+    if(!sc) continue;
+    const R=B[n].r*sc.s;
+    if(R<2.5) continue;
+    if(sc.x<0||sc.x>W||sc.y<0||sc.y>H) continue;
+    /* don't caption something hidden behind another world */
+    let hidden=false;
+    for(const o in B){
+      if(o===n) continue;
+      const osc=project(bodyPos(o,t));
+      if(!osc||osc.z>=sc.z) continue;
+      const oR=B[o].r*osc.s, dx=osc.x-sc.x, dy=osc.y-sc.y;
+      if(dx*dx+dy*dy<oR*oR*0.92){hidden=true;break;}
+    }
+    if(hidden) continue;
+    const txt=label(n).toUpperCase();
+    const w=ctx.measureText(txt).width+fs*0.3;
+    const x=Math.max(w/2+fs*0.7,Math.min(W-w/2-fs*0.7,sc.x));
+    const y=Math.min(H-fs*2.2,sc.y+R+fs*0.9);
+    ctx.globalAlpha=a*0.85;
+    ctx.strokeStyle='rgba(190,205,235,0.5)';
+    ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(x-w/2,y+fs*1.42);ctx.lineTo(x+w/2,y+fs*1.42);ctx.stroke();
+    ctx.globalAlpha=a;
+    ctx.shadowColor='rgba(0,0,0,0.85)';ctx.shadowBlur=fs*0.5;
+    ctx.fillStyle='rgba(232,240,255,0.94)';
+    ctx.fillText(txt,x,y);
+    ctx.shadowBlur=0;
+  }
+  ctx.restore();
+}
+
+/* ================= RENDER LOOP ================= */
+const ORDER=['mercury','venus','earth','mars','ceres','jupiter','saturn','uranus','neptune','pluto',
+             'luna','io','europa','ganymede','callisto','titan','triton'];
+let t0=performance.now();
+
+function frame(){
+  const now=performance.now();
+  const t=((now-t0)/1000)%LOOP;
+  CAM=camAt(t);
+
+  ctx.fillStyle='#000308';ctx.fillRect(0,0,W,H);
+
+  // stars
+  for(const st of STARS){
+    const s=project(st.p); if(!s) continue;
+    if(s.x<-4||s.x>W+4||s.y<-4||s.y>H+4) continue;
+    ctx.globalAlpha=0.35+0.65*st.m;
+    ctx.fillStyle=st.c;
+    const r=st.m*1.25;
+    ctx.fillRect(s.x-r/2,s.y-r/2,r,r);
+  }
+  ctx.globalAlpha=1;
+
+  const list=[];
+
+  // sun
+  {const s=project([0,0,0]); if(s) list.push({z:s.z,draw:()=>drawSun(s,t)});}
+
+  // planets & moons
+  for(const n of ORDER){
+    const p=bodyPos(n,t), s=project(p);
+    if(!s) continue;
+    const R=B[n].r*s.s;
+    if(s.x<-R-40||s.x>W+R+40||s.y<-R-40||s.y>H+R+40) continue;
+    list.push({z:s.z,draw:()=>drawSphere(n,p,s,t)});
+    if(n==='saturn' && R>1.5) pushRings(list,p,t);
+  }
+
+  // small bodies
+  for(const o of ROCKS){
+    const p=rockPos(o,t);
+    const d=sub(p,CAM.eye);
+    const dd=len(d);
+    if(dd>(o.kind?260:6)) continue;
+    const s=project(p); if(!s) continue;
+    if(s.x<-30||s.x>W+30||s.y<-30||s.y>H+30) continue;
+    const R=o.r*s.s;
+    if(R<0.32||R>70) continue;
+    list.push({z:s.z,draw:function(){
+      const L=norm(sub([0,0,0],p));
+      const lx=dot(L,CAM.r), ly=dot(L,CAM.u);
+      const g=ctx.createRadialGradient(s.x+lx*R*0.6,s.y-ly*R*0.6,R*0.05,s.x,s.y,R*1.5);
+      const c=o.kind?'rgba(180,195,215,':'rgba(160,148,132,';
+      g.addColorStop(0,c+(0.95*o.g+0.05)+')');
+      g.addColorStop(0.6,c+(0.45*o.g)+')');
+      g.addColorStop(1,'rgba(10,10,14,1)');
+      ctx.fillStyle=g;
+      ctx.beginPath();ctx.ellipse(s.x,s.y,R*o.sh,R/(o.sh*0.9),o.g*3,0,TAU);ctx.fill();
+    }});
+  }
+
+  list.sort((a,b)=>b.z-a.z);
+  for(const it of list) it.draw();
+
+  // caption whatever the camera is currently pointed at
+  drawLabels(t);
+
+  // fade at loop seams
+  let fade=0;
+  if(t<3.2) fade=1-t/3.2;
+  else if(t>LOOP-4.5) fade=(t-(LOOP-4.5))/4.5;
+  if(fade>0){ctx.fillStyle='rgba(0,0,0,'+Math.min(1,fade)+')';ctx.fillRect(0,0,W,H);}
+
+  // vignette
+  const vr=Math.max(W,H);
+  const v=ctx.createRadialGradient(W/2,H/2,vr*0.34,W/2,H/2,vr*0.72);
+  v.addColorStop(0,'rgba(0,0,0,0)');v.addColorStop(1,'rgba(0,0,0,0.55)');
+  ctx.fillStyle=v;ctx.fillRect(0,0,W,H);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
